@@ -38,3 +38,12 @@ test('apresenta erros da API e de conexão', async () => {
   globalThis.fetch = async () => { throw new TypeError('network error'); };
   await assert.rejects(listDocuments('alice'), { message: 'Não foi possível conectar ao servidor.' });
 });
+
+test('codifica identificadores Unicode que não cabem no cabeçalho HTTP', async () => {
+  globalThis.fetch = async (url, options) => {
+    assert.equal(options.headers['X-User-Id'], encodeURIComponent('usuário 漢字'));
+    assert.equal(options.headers['X-User-Id-Encoding'], 'percent-utf8');
+    return Response.json([]);
+  };
+  assert.deepEqual(await listDocuments('usuário 漢字'), []);
+});

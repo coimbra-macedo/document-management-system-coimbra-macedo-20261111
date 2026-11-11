@@ -7,6 +7,7 @@ const path = require('node:path');
 const storageDir = path.join(os.tmpdir(), `dms-test-${process.pid}`);
 process.env.STORAGE_DIR = storageDir;
 process.env.MAX_UPLOAD_SIZE_BYTES = '5';
+process.env.UPLOAD_RATE_LIMIT = '20';
 const app = require('../src/app');
 
 // Teste de fumaça do seed: garante que o app Express foi exportado.
@@ -44,9 +45,21 @@ test('fluxo de documentos respeita o contrato da API', async (context) => {
   });
   assert.strictEqual(invalidJson.status, 400);
   assert.ok((await invalidJson.json()).error);
+  const largeJson = await request('/upload', {
+    method: 'POST',
+    headers: { 'X-User-Id': 'alice', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ value: 'a'.repeat(110000) }),
+  });
+  assert.strictEqual(largeJson.status, 413);
   assert.strictEqual((await upload('alice', null)).status, 400);
   assert.strictEqual((await upload('alice', '123456')).status, 413);
   assert.strictEqual((await upload('alice', 'abc', 'outro')).status, 400);
+  const excessiveFields = new FormData();
+  for (let index = 0; index < 30; index++) excessiveFields.append(`campo${index}`, 'valor');
+  excessiveFields.append('file', new Blob(['abc']), 'teste.txt');
+  assert.strictEqual((await request('/upload', {
+    method: 'POST', headers: { 'X-User-Id': 'alice' }, body: excessiveFields,
+  })).status, 400);
   const malformed = await request('/upload', {
     method: 'POST',
     headers: { 'X-User-Id': 'alice', 'Content-Type': 'multipart/form-data' },
@@ -73,6 +86,7 @@ test('fluxo de documentos respeita o contrato da API', async (context) => {
   assert.deepStrictEqual(await (await request('/documents', { headers: bobHeaders })).json(), []);
   const download = await request(`/documents/${document.id}/download`, { headers: aliceHeaders });
   assert.strictEqual(download.status, 200);
+  assert.strictEqual(download.headers.get('cache-control'), 'private, no-store');
   assert.strictEqual(download.headers.get('content-type'), 'text/plain');
   assert.match(download.headers.get('content-disposition'), /attachment;.*teste\.txt/);
   assert.strictEqual(await download.text(), 'abc');
@@ -80,10 +94,48 @@ test('fluxo de documentos respeita o contrato da API', async (context) => {
   assert.strictEqual((await request('/documents/inexistente/download', { headers: aliceHeaders })).status, 404);
   const secondDocument = await (await upload('alice', 'xyz')).json();
   assert.deepStrictEqual(await (await request('/documents', { headers: aliceHeaders })).json(), [secondDocument, document]);
+  assert.deepStrictEqual(await (await request('/documents?limit=1&offset=1', { headers: aliceHeaders })).json(), [document]);
+  assert.strictEqual((await request('/documents?limit=0', { headers: aliceHeaders })).status, 400);
+  const namedFile = new FormData();
+  namedFile.append('file', new Blob(['abc']), 'documento-ação-漢字.txt');
+  const namedResponse = await request('/upload', { method: 'POST', headers: aliceHeaders, body: namedFile });
+  assert.strictEqual(namedResponse.status, 201);
+  assert.strictEqual((await namedResponse.json()).originalName, 'documento-ação-漢字.txt');
+  const legacyBody = Buffer.from('--limite\r\nContent-Disposition: form-data; name="file"; filename="café.txt"\r\nContent-Type: text/plain\r\n\r\nabc\r\n--limite--\r\n', 'latin1');
+  const legacyResponse = await request('/upload', {
+    method: 'POST', headers: { ...aliceHeaders, 'Content-Type': 'multipart/form-data; boundary=limite' }, body: legacyBody,
+  });
+  assert.strictEqual(legacyResponse.status, 201);
+  assert.strictEqual((await legacyResponse.json()).originalName, 'café.txt');
+  const traversalFile = new FormData();
+  traversalFile.append('file', new Blob(['abc']), '../../fora.txt');
+  const traversalResponse = await request('/upload', { method: 'POST', headers: aliceHeaders, body: traversalFile });
+  assert.strictEqual(traversalResponse.status, 201);
+  assert.strictEqual((await traversalResponse.json()).originalName, 'fora.txt');
+  for (const filename of await fs.readdir(storageDir)) {
+    assert.match(filename, /^[0-9a-f-]{36}$/);
+  }
+  const unicodeHeaders = { 'X-User-Id': encodeURIComponent('usuário 漢字'), 'X-User-Id-Encoding': 'percent-utf8' };
+  const unicodeFile = new FormData();
+  unicodeFile.append('file', new Blob(['abc']), 'teste.txt');
+  const unicodeResponse = await request('/upload', { method: 'POST', headers: unicodeHeaders, body: unicodeFile });
+  assert.strictEqual((await unicodeResponse.json()).owner, 'usuário 漢字');
+  assert.strictEqual((await (await request('/documents', { headers: unicodeHeaders })).json()).length, 1);
+  assert.strictEqual((await request('/documents', { headers: { 'X-User-Id': '%FF', 'X-User-Id-Encoding': 'percent-utf8' } })).status, 400);
+  if (process.platform !== 'win32') assert.strictEqual((await fs.stat(storageDir)).mode & 0o077, 0);
   for (const filename of await fs.readdir(storageDir)) {
     await fs.unlink(path.join(storageDir, filename));
   }
   const missingFile = await request(`/documents/${document.id}/download`, { headers: aliceHeaders });
   assert.strictEqual(missingFile.status, 404);
+  assert.match(missingFile.headers.get('content-type'), /^application\/json/);
+  assert.strictEqual(missingFile.headers.get('content-disposition'), null);
   assert.ok((await missingFile.json()).error);
+  let limitedResponse;
+  for (let index = 0; index <= 20; index++) {
+    limitedResponse = await upload('alice', null);
+    if (limitedResponse.status === 429) break;
+  }
+  assert.strictEqual(limitedResponse.status, 429);
+  assert.ok((await limitedResponse.json()).error);
 });

@@ -1,9 +1,14 @@
 async function request(path, owner, options = {}) {
   let response;
+  const headers = { ...options.headers, 'X-User-Id': owner };
+  if (/[^\u0000-\u00ff]/.test(owner)) {
+    headers['X-User-Id'] = encodeURIComponent(owner);
+    headers['X-User-Id-Encoding'] = 'percent-utf8';
+  }
   try {
     response = await fetch(`/api${path}`, {
       ...options,
-      headers: { ...options.headers, 'X-User-Id': owner },
+      headers,
     });
   } catch (error) {
     if (error.name === 'AbortError') throw error;
